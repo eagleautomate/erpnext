@@ -242,7 +242,7 @@ frappe.ui.form.on("BOM", {
 						qty: data.qty || 0.0,
 						project: frm.doc.project,
 						variant_items: variant_items,
-						use_multi_level_bom: use_multi_level_bom,
+						use_multi_level_bom: frm.doc?.track_semi_finished_goods ? 0 : use_multi_level_bom,
 					},
 					freeze: true,
 					callback(r) {
@@ -331,12 +331,14 @@ frappe.ui.form.on("BOM", {
 				},
 			});
 
-			fields.push({
-				fieldtype: "Check",
-				label: __("Use Multi-Level BOM"),
-				fieldname: "use_multi_level_bom",
-				default: frm.doc?.__onload.use_multi_level_bom,
-			});
+			if (!frm.doc.track_semi_finished_goods) {
+				fields.push({
+					fieldtype: "Check",
+					label: __("Use Multi-Level BOM"),
+					fieldname: "use_multi_level_bom",
+					default: frm.doc?.__onload.use_multi_level_bom,
+				});
+			}
 		}
 
 		var has_template_rm = frm.doc.items.filter((d) => d.has_variants === 1) || [];
@@ -548,6 +550,10 @@ erpnext.bom.BomController = class BomController extends erpnext.TransactionContr
 
 		if (child.bom_no) {
 			child.bom_no = "";
+		}
+
+		if (doc.item == child.item_code) {
+			child.do_not_explode = 1;
 		}
 
 		get_bom_material_detail(doc, cdt, cdn, scrap_items);

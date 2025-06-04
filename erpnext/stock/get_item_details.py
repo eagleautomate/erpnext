@@ -193,6 +193,9 @@ def update_stock(ctx, out, doc=None):
 		and out.warehouse
 		and out.stock_qty > 0
 	):
+		if doc and isinstance(doc, dict):
+			doc = frappe._dict(doc)
+
 		kwargs = frappe._dict(
 			{
 				"item_code": ctx.item_code,
@@ -212,13 +215,21 @@ def update_stock(ctx, out, doc=None):
 				filter_batches(batches, doc)
 
 			for batch_no, batch_qty in batches.items():
+				rate = get_batch_based_item_price(
+					{"price_list": doc.get("selling_price_list"), "uom": out.uom, "batch_no": batch_no},
+					out.item_code,
+				)
 				if batch_qty >= qty:
 					out.update({"batch_no": batch_no, "actual_batch_qty": qty})
+					if rate:
+						out.update({"rate": rate, "price_list_rate": rate})
 					break
 				else:
 					qty -= batch_qty
 
 				out.update({"batch_no": batch_no, "actual_batch_qty": batch_qty})
+				if rate:
+					out.update({"rate": rate, "price_list_rate": rate})
 
 		if out.has_serial_no and out.has_batch_no and has_incorrect_serial_nos(ctx, out):
 			kwargs["batches"] = [ctx.get("batch_no")] if ctx.get("batch_no") else [out.get("batch_no")]
@@ -951,8 +962,8 @@ def get_price_list_rate(ctx: ItemDetailsCtx, item_doc, out: ItemDetails = None):
 			price_list_rate = get_price_list_rate_for(ctx, item_doc.variant_of)
 
 		# insert in database
-		if price_list_rate is None or frappe.db.get_single_value(
-			"Stock Settings", "update_existing_price_list_rate"
+		if price_list_rate is None or frappe.get_cached_value(
+			"Stock Settings", "Stock Settings", "update_existing_price_list_rate"
 		):
 			insert_item_price(ctx)
 
@@ -977,54 +988,69 @@ def insert_item_price(ctx: ItemDetailsCtx):
 	if not ctx.price_list or not ctx.rate or ctx.is_internal_supplier or ctx.is_internal_customer:
 		return
 
-	if frappe.db.get_value("Price List", ctx.price_list, "currency", cache=True) == ctx.currency and cint(
-		frappe.db.get_single_value("Stock Settings", "auto_insert_price_list_rate_if_missing")
-	):
-		if frappe.has_permission("Item Price", "write"):
-			price_list_rate = (
-				(flt(ctx.rate) + flt(ctx.discount_amount)) / ctx.conversion_factor
-				if ctx.conversion_factor
-				else (flt(ctx.rate) + flt(ctx.discount_amount))
-			)
+	stock_settings = frappe.get_cached_doc("Stock Settings")
 
-			item_price = frappe.db.get_value(
-				"Item Price",
-				{
-					"item_code": ctx.item_code,
-					"price_list": ctx.price_list,
-					"currency": ctx.currency,
-					"uom": ctx.stock_uom,
-				},
-				["name", "price_list_rate"],
-				as_dict=1,
-			)
-			if item_price and item_price.name:
-				if item_price.price_list_rate != price_list_rate and frappe.db.get_single_value(
-					"Stock Settings", "update_existing_price_list_rate"
-				):
-					frappe.db.set_value("Item Price", item_price.name, "price_list_rate", price_list_rate)
-					frappe.msgprint(
-						_("Item Price updated for {0} in Price List {1}").format(
-							ctx.item_code, ctx.price_list
-						),
-						alert=True,
-					)
-			else:
-				item_price = frappe.get_doc(
-					{
-						"doctype": "Item Price",
-						"price_list": ctx.price_list,
-						"item_code": ctx.item_code,
-						"currency": ctx.currency,
-						"price_list_rate": price_list_rate,
-						"uom": ctx.stock_uom,
-					}
-				)
-				item_price.insert()
-				frappe.msgprint(
-					_("Item Price added for {0} in Price List {1}").format(ctx.item_code, ctx.price_list),
-					alert=True,
-				)
+	if (
+		not frappe.db.get_value("Price List", ctx.price_list, "currency", cache=True) == ctx.currency
+		or not stock_settings.auto_insert_price_list_rate_if_missing
+		or not frappe.has_permission("Item Price", "write")
+	):
+		return
+
+	item_price = frappe.db.get_value(
+		"Item Price",
+		{
+			"item_code": ctx.item_code,
+			"price_list": ctx.price_list,
+			"currency": ctx.currency,
+			"uom": ctx.stock_uom,
+		},
+		["name", "price_list_rate"],
+		as_dict=1,
+	)
+
+	update_based_on_price_list_rate = stock_settings.update_price_list_based_on == "Price List Rate"
+
+	if item_price and item_price.name:
+		if not stock_settings.update_existing_price_list_rate:
+			return
+
+		rate_to_consider = flt(ctx.price_list_rate) if update_based_on_price_list_rate else flt(ctx.rate)
+		price_list_rate = _get_stock_uom_rate(rate_to_consider, ctx)
+
+		if not price_list_rate or item_price.price_list_rate == price_list_rate:
+			return
+
+		frappe.db.set_value("Item Price", item_price.name, "price_list_rate", price_list_rate)
+		frappe.msgprint(
+			_("Item Price updated for {0} in Price List {1}").format(ctx.item_code, ctx.price_list),
+			alert=True,
+		)
+	else:
+		rate_to_consider = (
+			(flt(ctx.price_list_rate) or flt(ctx.rate)) if update_based_on_price_list_rate else flt(ctx.rate)
+		)
+		price_list_rate = _get_stock_uom_rate(rate_to_consider, ctx)
+
+		item_price = frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"price_list": ctx.price_list,
+				"item_code": ctx.item_code,
+				"currency": ctx.currency,
+				"price_list_rate": price_list_rate,
+				"uom": ctx.stock_uom,
+			}
+		)
+		item_price.insert()
+		frappe.msgprint(
+			_("Item Price added for {0} in Price List {1}").format(ctx.item_code, ctx.price_list),
+			alert=True,
+		)
+
+
+def _get_stock_uom_rate(rate: float, ctx: ItemDetailsCtx):
+	return rate / ctx.conversion_factor if ctx.conversion_factor else rate
 
 
 def get_item_price(
@@ -1084,7 +1110,9 @@ def get_batch_based_item_price(pctx: ItemPriceCtx | dict | str, item_code) -> fl
 	if not item_price:
 		item_price = get_item_price(pctx, item_code, ignore_party=True, force_batch_no=True)
 
-	if item_price and item_price[0].uom == pctx.uom:
+	is_free_item = pctx.get("items", [{}])[0].get("is_free_item")
+
+	if item_price and item_price[0].uom == pctx.uom and not is_free_item:
 		return item_price[0].price_list_rate
 
 	return 0.0

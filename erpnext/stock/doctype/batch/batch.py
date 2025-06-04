@@ -157,8 +157,12 @@ class Batch(Document):
 			frappe.throw(_("The selected item cannot have Batch"))
 
 	def set_batchwise_valuation(self):
+		from erpnext.stock.utils import get_valuation_method
+
 		if self.is_new():
-			if frappe.db.get_single_value("Stock Settings", "do_not_use_batchwise_valuation"):
+			if get_valuation_method(self.item) == "Moving Average" and frappe.db.get_single_value(
+				"Stock Settings", "do_not_use_batchwise_valuation"
+			):
 				self.use_batchwise_valuation = 0
 				return
 
@@ -219,6 +223,7 @@ def get_batch_qty(
 	ignore_voucher_nos=None,
 	for_stock_levels=False,
 	consider_negative_batches=False,
+	do_not_check_future_batches=False,
 ):
 	"""Returns batch actual qty if warehouse is passed,
 	        or returns dict of qty by warehouse if warehouse is None
@@ -245,6 +250,7 @@ def get_batch_qty(
 			"ignore_voucher_nos": ignore_voucher_nos,
 			"for_stock_levels": for_stock_levels,
 			"consider_negative_batches": consider_negative_batches,
+			"do_not_check_future_batches": do_not_check_future_batches,
 		}
 	)
 
@@ -455,10 +461,14 @@ def get_available_batches(kwargs):
 
 	batches = get_auto_batch_nos(kwargs)
 	for batch in batches:
-		if batch.get("batch_no") not in batchwise_qty:
-			batchwise_qty[batch.get("batch_no")] = batch.get("qty")
+		key = batch.get("batch_no")
+		if kwargs.get("based_on_warehouse"):
+			key = (batch.get("batch_no"), batch.get("warehouse"))
+
+		if key not in batchwise_qty:
+			batchwise_qty[key] = batch.get("qty")
 		else:
-			batchwise_qty[batch.get("batch_no")] += batch.get("qty")
+			batchwise_qty[key] += batch.get("qty")
 
 	return batchwise_qty
 

@@ -359,6 +359,7 @@ def get_children(doctype=None, parent=None, **kwargs):
 
 	fields = [
 		"item_code as value",
+		"item_name as title",
 		"is_expandable as expandable",
 		"parent as parent_id",
 		"qty",
@@ -368,16 +369,8 @@ def get_children(doctype=None, parent=None, **kwargs):
 		"uom",
 		"rate",
 		"amount",
-		"workstation_type",
 		"operation",
-		"operation_time",
 		"is_subcontracted",
-		"workstation",
-		"source_warehouse",
-		"wip_warehouse",
-		"fg_warehouse",
-		"skip_material_transfer",
-		"backflush_from_wip_warehouse",
 	]
 
 	query_filters = {

@@ -33,6 +33,7 @@ from erpnext.controllers.item_variant import (
 	validate_item_variant_attributes,
 )
 from erpnext.stock.doctype.item_default.item_default import ItemDefault
+from erpnext.stock.utils import get_valuation_method
 
 
 class DuplicateReorderRows(frappe.ValidationError):
@@ -153,6 +154,7 @@ class Item(Document):
 	def onload(self):
 		self.set_onload("stock_exists", self.stock_ledger_created())
 		self.set_onload("asset_naming_series", get_asset_naming_series())
+		self.set_onload("current_valuation_method", get_valuation_method(self.name))
 
 	def autoname(self):
 		if frappe.db.get_default("item_naming_by") == "Naming Series":
@@ -224,7 +226,10 @@ class Item(Document):
 
 	def validate_description(self):
 		"""Clean HTML description if set"""
-		if cint(frappe.db.get_single_value("Stock Settings", "clean_description_html")):
+		if (
+			cint(frappe.db.get_single_value("Stock Settings", "clean_description_html"))
+			and self.description != self.item_name  # perf: Avoid cleaning up a fallback
+		):
 			self.description = clean_html(self.description)
 
 	def validate_customer_provided_part(self):
@@ -304,7 +309,7 @@ class Item(Document):
 			if self.stock_ledger_created():
 				frappe.throw(_("Cannot be a fixed asset item as Stock Ledger is created."))
 
-		if not self.is_fixed_asset:
+		if not self.is_fixed_asset and not self.is_new():
 			asset = frappe.db.get_all("Asset", filters={"item_code": self.name, "docstatus": 1}, limit=1)
 			if asset:
 				frappe.throw(
@@ -524,6 +529,9 @@ class Item(Document):
 		return self._stock_ledger_created
 
 	def update_item_price(self):
+		if self.is_new():
+			return
+
 		frappe.db.sql(
 			"""
 				UPDATE `tabItem Price`
@@ -720,23 +728,9 @@ class Item(Document):
 		if self.item_defaults or not self.item_group:
 			return
 
-		item_defaults = frappe.db.get_values(
-			"Item Default",
-			{"parent": self.item_group},
-			[
-				"company",
-				"default_warehouse",
-				"default_price_list",
-				"buying_cost_center",
-				"default_supplier",
-				"expense_account",
-				"selling_cost_center",
-				"income_account",
-			],
-			as_dict=1,
-		)
-		if item_defaults:
-			for item in item_defaults:
+		item_group = frappe.get_cached_doc("Item Group", self.item_group)
+		if item_group.item_group_defaults:
+			for item in item_group.item_group_defaults:
 				self.append(
 					"item_defaults",
 					{
@@ -757,9 +751,8 @@ class Item(Document):
 			if (
 				defaults.get("default_warehouse")
 				and defaults.company
-				and frappe.db.exists(
-					"Warehouse", {"name": defaults.default_warehouse, "company": defaults.company}
-				)
+				and defaults.company
+				== frappe.get_cached_value("Warehouse", defaults.default_warehouse, "company")
 			):
 				self.append(
 					"item_defaults",
@@ -788,7 +781,10 @@ class Item(Document):
 					)
 
 	def validate_has_variants(self):
-		if not self.has_variants and frappe.db.get_value("Item", self.name, "has_variants"):
+		if self.is_new():
+			return
+
+		if not self.has_variants and self.has_value_changed("has_variants"):
 			if frappe.db.exists("Item", {"variant_of": self.name}):
 				frappe.throw(_("Item has variants."))
 
@@ -896,13 +892,17 @@ class Item(Document):
 			for d in frappe.db.get_all("Item", filters={"variant_of": self.name}):
 				check_stock_uom_with_bin(d.name, self.stock_uom)
 		if self.variant_of:
-			template_uom = frappe.db.get_value("Item", self.variant_of, "stock_uom")
-			if template_uom != self.stock_uom:
-				frappe.throw(
-					_("Default Unit of Measure for Variant '{0}' must be same as in Template '{1}'").format(
-						self.stock_uom, template_uom
+			allow_different_uom = frappe.get_cached_value(
+				"Item Variant Settings", "Item Variant Settings", "allow_different_uom"
+			)
+			if not allow_different_uom:
+				template_uom = frappe.db.get_value("Item", self.variant_of, "stock_uom")
+				if template_uom != self.stock_uom:
+					frappe.throw(
+						_(
+							"Default Unit of Measure for Variant '{0}' must be same as in Template '{1}'"
+						).format(self.stock_uom, template_uom)
 					)
-				)
 
 	def validate_uom_conversion_factor(self):
 		if self.uoms:
@@ -970,6 +970,11 @@ class Item(Document):
 		changed_fields = [
 			field for field in restricted_fields if cstr(self.get(field)) != cstr(values.get(field))
 		]
+
+		# Allow to change valuation method from FIFO to Moving Average not vice versa
+		if self.valuation_method == "Moving Average" and "valuation_method" in changed_fields:
+			changed_fields.remove("valuation_method")
+
 		if not changed_fields:
 			return
 
@@ -1196,7 +1201,7 @@ def get_last_purchase_details(item_code, doc_name=None, conversion_rate=1.0):
 	return out
 
 
-def get_purchase_voucher_details(doctype, item_code, document_name):
+def get_purchase_voucher_details(doctype, item_code, document_name=None):
 	parent_doc = frappe.qb.DocType(doctype)
 	child_doc = frappe.qb.DocType(doctype + " Item")
 
@@ -1215,8 +1220,10 @@ def get_purchase_voucher_details(doctype, item_code, document_name):
 		)
 		.where(parent_doc.docstatus == 1)
 		.where(child_doc.item_code == item_code)
-		.where(parent_doc.name != document_name)
 	)
+
+	if document_name:
+		query = query.where(parent_doc.name != document_name)
 
 	if doctype in ("Purchase Receipt", "Purchase Invoice"):
 		query = query.select(parent_doc.posting_date, parent_doc.posting_time)
